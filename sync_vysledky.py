@@ -27,17 +27,56 @@ from html.parser import HTMLParser
 # --- Nastavenia --------------------------------------------------------------
 
 SZFB_BASE = "https://www.szfb.sk"
-# Florbalova extraliga muzov 2026/2027 (TournamentID na szfb.sk)
-SZFB_RESULTS = SZFB_BASE + "/sk/stats/results/1241/florbalova-extraliga-muzov"
-SZFB_STANDINGS = SZFB_BASE + "/sk/stats/standings/1241/florbalova-extraliga-muzov"
 SZFB_OUR_ABBR = "TSU"
 
 ADMIN_BASE = "https://tsunamiflorbal.eoscms.cz"
+ADMIN_DASHBOARD = ADMIN_BASE + "/dashboard"
 ADMIN_SEASON_ID = 3   # 2026/2027
-ADMIN_TEAM_ID = 25    # Muzi
-ADMIN_FILTER = f"sid={ADMIN_SEASON_ID}&tid={ADMIN_TEAM_ID}"
-ADMIN_GAMES = f"{ADMIN_BASE}/games/?{ADMIN_FILTER}&dataview=games_all"
-ADMIN_STANDINGS = f"{ADMIN_BASE}/games/standings/?{ADMIN_FILTER}"
+
+
+class Competition:
+    """Sutaz na szfb.sk (TournamentID) a k nej prisluchajuci tim v admine.
+
+    Ak je liga na szfb.sk rozdelena do divizii, kazda divizia je samostatna sutaz v admine:
+    szfb_part = TournamentPartID divizie, admin_cid = ID sutaze v admine. Zoznam zapasov
+    v admine sa podla sutaze filtrovat neda, preto zapasy synchronizuje len jedna z divizii
+    (games=True) a ostatne len tabulku."""
+
+    def __init__(self, name, szfb_id, szfb_slug, admin_team_id, szfb_part=None, admin_cid=None, games=True):
+        self.name = name
+        self.games = games
+        self.results = f"{SZFB_BASE}/sk/stats/results/{szfb_id}/{szfb_slug}"
+        self.standings = f"{SZFB_BASE}/sk/stats/standings/{szfb_id}/{szfb_slug}"
+        if szfb_part:
+            self.standings += f"?TournamentPartID={szfb_part}"
+        self.filter = f"sid={ADMIN_SEASON_ID}&tid={admin_team_id}"
+        if admin_cid:
+            self.filter += f"&cid={admin_cid}"
+        self.admin_games = f"{ADMIN_BASE}/games/?sid={ADMIN_SEASON_ID}&tid={admin_team_id}&dataview=games_all"
+        self.admin_standings = f"{ADMIN_BASE}/games/standings/?{self.filter}"
+
+
+COMPETITIONS = [
+    Competition("Extraliga muzov", 1241, "florbalova-extraliga-muzov", 25),
+    Competition("Liga juniorov", 1263, "liga-juniorov-bratislava", 24),
+    # Tsunami ma v lige dva timy (A a B), oba su v admine pod druzstvom Dorastenci
+    Competition("Liga dorastencov", 1266, "liga-dorastencov-bratislava", 23),
+    # dve divizie, dve sutaze v admine; timy A (zelena) a B (cervena) pod druzstvom Starsi ziaci
+    Competition("Liga starsich ziakov - Zelena divizia", 1280, "liga-starsich-ziakov-bratislava", 21,
+                szfb_part=4861, admin_cid=39),
+    Competition("Liga starsich ziakov - Cervena divizia", 1280, "liga-starsich-ziakov-bratislava", 21,
+                szfb_part=4862, admin_cid=40, games=False),
+    # styri divizie 1. kola; Heroes (zelena) a Surfers (zlta) pod druzstvom Mladsi ziaci.
+    # Cervena a Biela maju tabulky vygenerovane z pomocnych skrytych zapasov (bez kodu, skript ich ignoruje).
+    Competition("Liga mladsich ziakov - Zelena divizia", 1279, "liga-mladsich-ziakov-bratislava", 22,
+                szfb_part=4857, admin_cid=41),
+    Competition("Liga mladsich ziakov - Zlta divizia", 1279, "liga-mladsich-ziakov-bratislava", 22,
+                szfb_part=4858, admin_cid=42, games=False),
+    Competition("Liga mladsich ziakov - Cervena divizia", 1279, "liga-mladsich-ziakov-bratislava", 22,
+                szfb_part=4859, admin_cid=43, games=False),
+    Competition("Liga mladsich ziakov - Biela divizia", 1279, "liga-mladsich-ziakov-bratislava", 22,
+                szfb_part=4860, admin_cid=44, games=False),
+]
 
 PLACES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miesta.txt")
 
@@ -183,9 +222,9 @@ def szfb_team_abbrs(results_page):
         results_page))
 
 
-def szfb_standings(opener, abbrs):
+def szfb_standings(opener, comp, abbrs):
     """Vrati tabulku ako zoznam riadkov v poradi: {abbr, name, gp, ..., points}."""
-    _, page = fetch(opener, SZFB_STANDINGS)
+    _, page = fetch(opener, comp.standings)
     table = re.search(r"<table.*?</table>", page, re.S)
     rows = []
     for row in re.findall(r"<tr>.*?</tr>", table.group(0) if table else "", re.S):
@@ -324,9 +363,21 @@ def admin_request(opener, url, data=None):
     return page
 
 
+def admin_post_form(opener, url, fields):
+    """Odosle formular ako prehliadac. CSRF token doplna do formularov az JavaScript
+    zo <meta name="csrf-token">, preto ho pridame sami. Vrati chybovu hlasku alebo None."""
+    if not any(n == "csrf_token" for n, _ in fields):
+        fields = [("csrf_token", _csrf["token"])] + list(fields)
+    final_url, _ = fetch(opener, url, fields)
+    if is_login_page(final_url):
+        sys.exit("Session vyprsala pocas zapisu - spusti znova.")
+    error = urllib.parse.parse_qs(urllib.parse.urlparse(final_url).query).get("error")
+    return error[0] if error else None
+
+
 def admin_ajax(opener, name, params, check_ok=True):
     if not _csrf["token"]:
-        admin_request(opener, ADMIN_STANDINGS)
+        admin_request(opener, ADMIN_DASHBOARD)
     page = admin_request(opener, f"{ADMIN_BASE}/ajax/{name}.php",
                          dict(params, csrf_token=_csrf["token"]))
     try:
@@ -340,7 +391,7 @@ def admin_ajax(opener, name, params, check_ok=True):
 
 def clear_web_cache(opener):
     """To iste ako tlacidlo 'Promazat webovou cache' v admine."""
-    page = admin_request(opener, ADMIN_STANDINGS)
+    page = admin_request(opener, ADMIN_DASHBOARD)
     btn = page.find('id="clearWebCacheBtn"')
     hashes = re.findall(r"hash:\s*'([^']+)'", page[:btn] if btn >= 0 else "")
     if not hashes:
@@ -392,14 +443,14 @@ def schedule_changes(fields, src):
     return wanted
 
 
-def sync_games(opener, results_page, apply):
+def sync_games(opener, comp, results_page, apply):
     szfb = szfb_matches(results_page)
     played = sum(1 for m in szfb.values() if m["score_home"] is not None)
-    log(f"szfb.sk: {len(szfb)} zapasov Tsunami, z toho {played} odohranych.")
-    ids = list(dict.fromkeys(re.findall(r'/games/\?id=(\d+)"', admin_request(opener, ADMIN_GAMES))))
-    log(f"Admin: {len(ids)} zapasov.")
+    ids = list(dict.fromkeys(re.findall(r'/games/\?id=(\d+)"', admin_request(opener, comp.admin_games))))
+    log(f"Zapasy: szfb.sk {len(szfb)} (odohranych {played}), admin {len(ids)}.")
     if not ids:
-        sys.exit("CHYBA: v admine sa nenasli ziadne zapasy.")
+        log("Zapasy: v admine zatial nie su ziadne, preskakujem.")
+        return 0
 
     changed = 0
     for game_id in ids:
@@ -441,7 +492,10 @@ def sync_games(opener, results_page, apply):
             log(f"[nahlad] {label}: {desc}")
             continue
 
-        admin_request(opener, form.action, with_changes(f, diff) + [("submit_with_return", "")])
+        error = admin_post_form(opener, form.action, with_changes(f, diff) + [("submit_with_return", "")])
+        if error:
+            log(f"CHYBA {label}: admin odmietol ulozenie: {error}")
+            continue
         check = admin_game_form(opener, game_id)
         bad = [k for k, v in diff.items() if not check or game_value(check.fields, k) != v]
         log(f"CHYBA {label}: po ulozeni nesedi {', '.join(bad)}" if bad
@@ -451,44 +505,57 @@ def sync_games(opener, results_page, apply):
 
 # --- Tabulka -----------------------------------------------------------------
 
-def admin_standings(opener):
-    """Vrati riadky tabulky v admine v aktualnom poradi: [{id, abbr}]."""
-    page = admin_request(opener, ADMIN_STANDINGS)
+def norm_name(name):
+    return " ".join((name or "").split()).casefold()
+
+
+def admin_standings(opener, comp):
+    """Vrati riadky tabulky v admine v aktualnom poradi: [{id, name, abbr}]."""
+    page = admin_request(opener, comp.admin_standings)
     rows = []
     for row_id, body in re.findall(r'<tr id="row-standings-(\d+)"(.*?)</tr>', page, re.S):
-        team = re.search(r'team_name">.*?<div class="text-xs[^"]*">([^<]*)</div>', body, re.S)
-        abbr = html.unescape(team.group(1)).rsplit(" - ", 1)[-1].strip() if team else None
-        rows.append({"id": row_id, "abbr": abbr})
+        name = re.search(r'team_name">\s*<div class="font-semibold">([^<]*)</div>', body)
+        sub = re.search(r'team_name">.*?<div class="text-xs[^"]*">([^<]*)</div>', body, re.S)
+        abbr = html.unescape(sub.group(1)).rsplit(" - ", 1)[-1].strip() if sub else None
+        rows.append({"id": row_id, "name": html.unescape(name.group(1)) if name else "", "abbr": abbr})
     return rows
 
 
-def admin_standings_form(opener, row_id):
+def match_standings(source, admin):
+    """Sparuje riadky szfb.sk s riadkami v admine podla nazvu timu, inak podla skratky."""
+    by_name = {norm_name(r["name"]): r for r in admin}
+    by_abbr = {r["abbr"]: r for r in admin}
+    return {i: by_name.get(norm_name(s["name"])) or by_abbr.get(s["abbr"]) for i, s in enumerate(source)}
+
+
+def admin_standings_form(opener, comp, row_id):
     result = admin_ajax(opener, "get_modal", {
         "module": "games", "entity": "standings", "id": row_id,
-        "payload": "", "url_back_params": ADMIN_FILTER})
+        "payload": "", "url_back_params": comp.filter})
     return parse_form(result.get("data", ""), is_standings_form)
 
 
-def sync_standings(opener, results_page, apply):
-    source = szfb_standings(opener, szfb_team_abbrs(results_page))
-    admin = admin_standings(opener)
+def sync_standings(opener, comp, results_page, apply):
+    source = szfb_standings(opener, comp, szfb_team_abbrs(results_page))
+    admin = admin_standings(opener, comp)
     log(f"Tabulka: szfb.sk {len(source)} timov, admin {len(admin)} timov.")
     if not source or not admin:
-        sys.exit("CHYBA: tabulka je prazdna na szfb.sk alebo v admine.")
-    by_abbr = {r["abbr"]: r for r in admin}
-
-    unmatched = [s["name"] for s in source if s["abbr"] not in by_abbr]
-    if unmatched or len(source) != len(admin):
-        log(f"PRESKAKUJEM tabulku: nepodarilo sa sparovat timy {unmatched or ''} "
-            f"(szfb.sk {len(source)}, admin {len(admin)}).")
+        log("Tabulka: na szfb.sk alebo v admine zatial nie je, preskakujem.")
         return 0
 
+    matched = match_standings(source, admin)
+    unmatched = [s["name"] for i, s in enumerate(source) if not matched[i]]
+    if unmatched:
+        log(f"Tabulka: tieto timy v admine chybaju, preskakujem ich: {', '.join(unmatched)}")
+
     changed = 0
-    for src in source:
-        row = by_abbr[src["abbr"]]
-        form = admin_standings_form(opener, row["id"])
+    for i, src in enumerate(source):
+        row = matched[i]
+        if not row:
+            continue
+        form = admin_standings_form(opener, comp, row["id"])
         if not form:
-            log(f"CHYBA tabulka {src['abbr']}: nenasiel sa formular.")
+            log(f"CHYBA tabulka {src['name']}: nenasiel sa formular.")
             continue
         wanted = {k: src[k] for k in STANDINGS_FIELDS + ["score_h", "score_a", "points"]}
         diff = {k: v for k, v in wanted.items() if (field(form.fields, k) or "") != v}
@@ -497,25 +564,33 @@ def sync_standings(opener, results_page, apply):
         changed += 1
         desc = ", ".join(f"{k}: {field(form.fields, k)} -> {v}" for k, v in diff.items())
         if not apply:
-            log(f"[nahlad] tabulka {src['abbr']}: {desc}")
+            log(f"[nahlad] tabulka {src['name']}: {desc}")
             continue
-        admin_request(opener, ADMIN_STANDINGS, with_changes(form.fields, diff))
-        check = admin_standings_form(opener, row["id"])
+        error = admin_post_form(opener, comp.admin_standings, with_changes(form.fields, diff))
+        if error:
+            log(f"CHYBA tabulka {src['name']}: admin odmietol ulozenie: {error}")
+            continue
+        check = admin_standings_form(opener, comp, row["id"])
         bad = [k for k, v in diff.items() if not check or (field(check.fields, k) or "") != v]
-        log(f"CHYBA tabulka {src['abbr']}: po ulozeni nesedi {', '.join(bad)}" if bad
-            else f"Aktualizovana tabulka {src['abbr']}: {desc}")
+        log(f"CHYBA tabulka {src['name']}: po ulozeni nesedi {', '.join(bad)}" if bad
+            else f"Aktualizovana tabulka {src['name']}: {desc}")
 
-    wanted_order = [by_abbr[s["abbr"]]["id"] for s in source]
+    # poradie sa nastavuje, len ked su v admine presne tie iste timy ako na szfb.sk
+    if unmatched or len(source) != len(admin):
+        if len(source) != len(admin):
+            log(f"Tabulka: pocet timov nesedi (szfb.sk {len(source)}, admin {len(admin)}), poradie nemenim.")
+        return changed
+    wanted_order = [matched[i]["id"] for i in range(len(source))]
     if wanted_order != [r["id"] for r in admin]:
         changed += 1
-        order_desc = " ".join(s["abbr"] for s in source)
+        order_desc = ", ".join(s["name"] for s in source)
         if not apply:
             log(f"[nahlad] poradie tabulky: {order_desc}")
         else:
             admin_ajax(opener, "sortable_save", {
                 "module": "games", "entity": "standings", "view": "standings",
                 "items": json.dumps(wanted_order)})
-            now = [r["id"] for r in admin_standings(opener)]
+            now = [r["id"] for r in admin_standings(opener, comp)]
             log(f"Aktualizovane poradie tabulky: {order_desc}" if now == wanted_order
                 else "CHYBA: poradie tabulky sa po ulozeni nezmenilo.")
     return changed
@@ -535,9 +610,13 @@ def main():
     opener = make_opener(jar)
 
     try:
-        _, results_page = fetch(opener, SZFB_RESULTS)
-        changed = sync_games(opener, results_page, args.apply)
-        changed += sync_standings(opener, results_page, args.apply)
+        changed = 0
+        for comp in COMPETITIONS:
+            log(f"=== {comp.name} ===")
+            _, results_page = fetch(opener, comp.results)
+            if comp.games:
+                changed += sync_games(opener, comp, results_page, args.apply)
+            changed += sync_standings(opener, comp, results_page, args.apply)
         if changed == 0:
             log("Vsetko je aktualne.")
         elif args.apply:
