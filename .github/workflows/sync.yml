@@ -3,8 +3,11 @@ name: Aktualizacia vysledkov
 on:
   schedule:
     # Casy su v UTC (Slovensko = UTC+2 v lete, UTC+1 v zime).
-    # Pia-Ne: kazdych 20 minut medzi 12:00 a 22:59 UTC
-    - cron: "*/20 12-22 * * 5,6,0"
+    # So-Ne: kazdych 20 minut medzi 7:00 a 22:59 UTC (v lete 9:00-00:40, v zime 8:00-23:40)
+    #        - mladez hra cez vikend aj dopoludnia
+    - cron: "*/20 7-22 * * 6,0"
+    # Pia: kazdych 20 minut medzi 12:00 a 22:59 UTC
+    - cron: "*/20 12-22 * * 5"
     # Po-St: raz za hodinu vecer (zapasy cez tyzden)
     - cron: "5 16-22 * * 1-4"
   workflow_dispatch:
