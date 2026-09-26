@@ -1,0 +1,36 @@
+name: Aktualiz√°cia v√Ωsledkov
+
+on:
+  schedule:
+    # ƒåasy s√∫ v UTC (Slovensko = UTC+2 v lete, UTC+1 v zime).
+    # Pia‚ÄìNe: ka≈æd√Ωch 20 min√∫t medzi 12:00 a 22:59 UTC
+    - cron: "*/20 12-22 * * 5,6,0"
+    # Po‚Äì≈†t: raz za hodinu veƒçer (z√°pasy cez t√Ω≈æde≈à)
+    - cron: "5 16-22 * * 1-4"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Zap√≠sa≈• zmeny do adminu (inak len n√°hƒæad)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-vysledky
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Synchroniz√°cia so szfb.sk
+        env:
+          EOS_EMAIL: ${{ secrets.EOS_EMAIL }}
+          EOS_PASSWORD: ${{ secrets.EOS_PASSWORD }}
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.apply }}" = "true" ]; then
+            python3 sync_vysledky.py --apply
+          else
+            python3 sync_vysledky.py
+          fi
