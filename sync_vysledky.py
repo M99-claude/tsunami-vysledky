@@ -39,6 +39,8 @@ ADMIN_FILTER = f"sid={ADMIN_SEASON_ID}&tid={ADMIN_TEAM_ID}"
 ADMIN_GAMES = f"{ADMIN_BASE}/games/?{ADMIN_FILTER}&dataview=games_all"
 ADMIN_STANDINGS = f"{ADMIN_BASE}/games/standings/?{ADMIN_FILTER}"
 
+PLACES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miesta.txt")
+
 KEYCHAIN_SERVICE = "tsunami-eoscms"
 STATE_DIR = os.path.expanduser("~/Library/Application Support/tsunami-vysledky")
 COOKIE_FILE = os.path.join(STATE_DIR, "session.cookies")
@@ -47,7 +49,11 @@ USER_AGENT = "Mozilla/5.0 (Macintosh) tsunami-vysledky/1.0"
 
 # szfb oznacenie -> hodnota "Hraci doba" v admine
 RESULT_TYPE = {"": "", "pp": "p", "sn": "pn"}
-STATUS_PLAYED = "2"
+# "Stav utkani" v admine
+STATUS_ENTERED = "0"     # zadano (bez casu)
+STATUS_SCHEDULED = "1"   # naplanovano
+STATUS_PLAYED = "2"      # odehrano
+STATUS_FORFEIT = "5"     # zkontumovano
 
 # stlpce tabulky: poradie na szfb.sk (Z, V, Vp, R, Pp, P) -> polia v admine
 STANDINGS_FIELDS = ["gp", "gw", "gwot", "gt", "glot", "gl"]
@@ -104,8 +110,36 @@ def cells(row):
 
 # --- szfb.sk -----------------------------------------------------------------
 
+def load_place_names():
+    """Nacita miesta.txt: {nazov na szfb.sk: skrateny nazov na webe}."""
+    names = {}
+    if os.path.exists(PLACES_FILE):
+        with open(PLACES_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    full, short = line.split("=", 1)
+                    names[full.strip().casefold()] = short.strip()
+    return names
+
+
+PLACE_NAMES = load_place_names()
+
+
+def short_place(full):
+    return PLACE_NAMES.get(full.casefold(), full)
+
+
+def clean_place(text):
+    """'Tsunami Arena  "kategoria B"' -> 'Tsunami Arena'; 't.b.a.' -> ''."""
+    text = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", text)).split())
+    text = re.sub(r'\s*"kateg[^"]*"\s*$', "", text).strip()
+    return "" if text.lower() in ("t.b.a.", "tba", "") else text
+
+
 def szfb_matches(results_page):
-    """Vrati {kod zapasu: udaje} pre odohrane zapasy nasho timu."""
+    """Vrati {kod zapasu: udaje} pre vsetky zapasy nasho timu.
+    Pri neodohranych zapasoch je score_home/score_away None, neznamy cas/miesto je ''."""
     result = {}
     for row in results_page.split('<tr class="fn-tap-row')[1:]:
         code = re.search(r'<td class="hidden-xs ">\s*(\d+)\s*</td>', row)
@@ -113,18 +147,25 @@ def szfb_matches(results_page):
         score_box = re.search(r'<div class="game-clash-result text-center hidden-xs">(.*?)</div>', row, re.S)
         if not (code and len(abbrs) == 2 and score_box) or SZFB_OUR_ABBR not in abbrs:
             continue
+        date = re.search(r'hover-hide-sm-down[^"]*">\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s*<', row)
+        time = re.search(r'<div class="hidden-xs hover-hide[^"]*">\s*(\d{1,2}):(\d{2})\s*</div>', row)
+        place = re.search(r'<div class="td-box hidden-xs hidden-sm hover-hide[^"]*">(.*?)</div>', row, re.S)
         goals = re.findall(r'<span class="matchresult">(\d+)</span>', score_box.group(1))
-        if len(goals) != 2:
-            continue  # este neodohrany
         marker = re.search(r'font-small">(pp|sn)</span>', score_box.group(1))
         link = re.search(r'href="(/sk/stats/matches/[^"]+/match/\d+)"', score_box.group(1))
+        played = len(goals) == 2
         result[code.group(1)] = {
             "home_abbr": abbrs[0],
             "away_abbr": abbrs[1],
-            "score_home": goals[0],
-            "score_away": goals[1],
+            "date": f"{date.group(3)}-{int(date.group(2)):02d}-{int(date.group(1)):02d}" if date else "",
+            # 0:00 = cas este nie je zverejneny
+            "time": f"{int(time.group(1)):02d}:{time.group(2)}"
+                    if time and (int(time.group(1)), time.group(2)) != (0, "00") else "",
+            "place_full": clean_place(place.group(1)) if place else "",
+            "score_home": goals[0] if played else None,
+            "score_away": goals[1] if played else None,
             "result_type": RESULT_TYPE[marker.group(1) if marker else ""],
-            "url": SZFB_BASE + link.group(1) if link else None,
+            "url": SZFB_BASE + link.group(1) if link and played else None,
         }
     return result
 
@@ -244,8 +285,12 @@ def with_changes(fields, changes):
     return [(n, changes.get(n, v)) for n, v in fields]
 
 
-def is_login_page(url):
-    return urllib.parse.urlparse(url).path.rstrip("/") == "/login"
+def is_login_page(url, page=""):
+    """Admin pri neprihlasenom pouzivatelovi nepresmeruje cez HTTP, ale vrati stranku
+    s JavaScript presmerovanim na "/?uri=...", pripadne prihlasovaci formular."""
+    return (urllib.parse.urlparse(url).path.rstrip("/") == "/login"
+            or re.search(r'<form[^>]*action="[^"]*/login"', page) is not None
+            or re.search(r"location\.href\s*=\s*'[^']*\?uri=", page) is not None)
 
 
 def admin_login(opener):
@@ -254,9 +299,9 @@ def admin_login(opener):
     token = re.search(r'name="csrf_token" value="([^"]+)"', page)
     if not token:
         sys.exit("Na prihlasovacej stranke sa nenasiel CSRF token.")
-    url, _ = fetch(opener, ADMIN_BASE + "/login",
-                   {"csrf_token": token.group(1), "email": email, "password": password})
-    if is_login_page(url):
+    url, page = fetch(opener, ADMIN_BASE + "/login",
+                      {"csrf_token": token.group(1), "email": email, "password": password})
+    if is_login_page(url, page):
         sys.exit("Prihlasenie do adminu zlyhalo (skontroluj email/heslo).")
     log("Prihlaseny do adminu.")
 
@@ -267,11 +312,11 @@ _csrf = {"token": None}  # token z <meta name="csrf-token">, potrebny pre ajax v
 def admin_request(opener, url, data=None):
     """Poziadavka do adminu; ak session vyprsala, prihlasi sa znova a zopakuje ju."""
     final_url, page = fetch(opener, url, data)
-    if is_login_page(final_url):
+    if is_login_page(final_url, page):
         log("Session vyprsala alebo neexistuje - prihlasujem sa.")
         admin_login(opener)
         final_url, page = fetch(opener, url, data)
-        if is_login_page(final_url):
+        if is_login_page(final_url, page):
             sys.exit("Ani po prihlaseni sa nepodarilo otvorit admin.")
     meta = re.search(r'<meta name="csrf-token" content="([^"]+)"', page)
     if meta:
@@ -299,11 +344,47 @@ def admin_game_form(opener, game_id):
     return parse_form(admin_request(opener, f"{ADMIN_BASE}/games/?id={game_id}"), is_game_form)
 
 
+def game_value(fields, name):
+    """Hodnota pola zapasu v admine, cas zjednoteny na HH:MM."""
+    value = field(fields, name) or ""
+    if name == "cas":
+        value = value[:5]
+    return value
+
+
+def same_place(admin_place, szfb_place):
+    """Admin casto pouziva skrateny nazov haly ('MSH Trencin' vs 'MSH Trencin - centralna hala')."""
+    a, s = admin_place.casefold().strip(), szfb_place.casefold().strip()
+    return bool(a) and (s.startswith(a) or a.startswith(s))
+
+
+def schedule_changes(fields, src):
+    """Datum, cas, miesto a stav podla szfb.sk. Nezverejnene udaje (t.b.a.) v admine nemaze."""
+    wanted = {}
+    if src["date"]:
+        wanted["datum"] = src["date"]
+    if src["time"]:
+        wanted["cas"] = src["time"]
+    full = src["place_full"]
+    admin_place = field(fields, "misto") or ""
+    if full and admin_place != short_place(full) and not same_place(admin_place, full):
+        wanted["misto"] = short_place(full)
+        if full.casefold() not in PLACE_NAMES:
+            log(f"Info: hala '{full}' nie je v miesta.txt, zapisuje sa nazov zo szfb.sk.")
+    status = field(fields, "game_status")
+    if status == STATUS_ENTERED and src["time"]:
+        wanted["game_status"] = STATUS_SCHEDULED
+    return wanted
+
+
 def sync_games(opener, results_page, apply):
     szfb = szfb_matches(results_page)
-    log(f"szfb.sk: {len(szfb)} odohranych zapasov Tsunami.")
+    played = sum(1 for m in szfb.values() if m["score_home"] is not None)
+    log(f"szfb.sk: {len(szfb)} zapasov Tsunami, z toho {played} odohranych.")
     ids = list(dict.fromkeys(re.findall(r'/games/\?id=(\d+)"', admin_request(opener, ADMIN_GAMES))))
     log(f"Admin: {len(ids)} zapasov.")
+    if not ids:
+        sys.exit("CHYBA: v admine sa nenasli ziadne zapasy.")
 
     changed = 0
     for game_id in ids:
@@ -323,28 +404,31 @@ def sync_games(opener, results_page, apply):
             log(f"PRESKAKUJEM {label}: nesedi domaci/hostia medzi szfb.sk a adminom.")
             continue
 
-        wanted = {
-            "score_home": src["score_home"],
-            "score_away": src["score_away"],
-            "vysledek_typ": src["result_type"],
-            "game_status": STATUS_PLAYED,
-        }
-        periods = szfb_periods(opener, src["url"]) if src["url"] else ""
-        if periods:
-            wanted["tretiny"] = periods
-        diff = {k: v for k, v in wanted.items() if (field(f, k) or "") != v}
+        wanted = schedule_changes(f, src)
+        if src["score_home"] is not None:
+            wanted.update({
+                "score_home": src["score_home"],
+                "score_away": src["score_away"],
+                "vysledek_typ": src["result_type"],
+            })
+            if field(f, "game_status") != STATUS_FORFEIT:
+                wanted["game_status"] = STATUS_PLAYED
+            periods = szfb_periods(opener, src["url"]) if src["url"] else ""
+            if periods:
+                wanted["tretiny"] = periods
+        diff = {k: v for k, v in wanted.items() if game_value(f, k) != v}
         if not diff:
             continue
 
         changed += 1
-        desc = ", ".join(f"{k}: '{field(f, k) or ''}' -> '{v}'" for k, v in diff.items())
+        desc = ", ".join(f"{k}: '{game_value(f, k)}' -> '{v}'" for k, v in diff.items())
         if not apply:
             log(f"[nahlad] {label}: {desc}")
             continue
 
         admin_request(opener, form.action, with_changes(f, diff) + [("submit_with_return", "")])
         check = admin_game_form(opener, game_id)
-        bad = [k for k, v in diff.items() if not check or (field(check.fields, k) or "") != v]
+        bad = [k for k, v in diff.items() if not check or game_value(check.fields, k) != v]
         log(f"CHYBA {label}: po ulozeni nesedi {', '.join(bad)}" if bad
             else f"Aktualizovane {label}: {desc}")
     return changed
@@ -374,6 +458,8 @@ def sync_standings(opener, results_page, apply):
     source = szfb_standings(opener, szfb_team_abbrs(results_page))
     admin = admin_standings(opener)
     log(f"Tabulka: szfb.sk {len(source)} timov, admin {len(admin)} timov.")
+    if not source or not admin:
+        sys.exit("CHYBA: tabulka je prazdna na szfb.sk alebo v admine.")
     by_abbr = {r["abbr"]: r for r in admin}
 
     unmatched = [s["name"] for s in source if s["abbr"] not in by_abbr]

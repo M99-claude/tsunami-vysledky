@@ -1,0 +1,10 @@
+# Skratene nazvy miest konania pre klubovy web.
+# Format: nazov na szfb.sk = nazov na webe
+# Doplnok "kategoria X" sa zo szfb.sk odstranuje automaticky, sem ho nepis.
+# Hala, ktora tu nie je, sa zapise tak, ako je na szfb.sk.
+
+MŠH Trenčín - centrálna hala = MŠH Trenčín
+ŠH FTVŠ UK - prof. Rovného Bratislava = ŠH FTVŠ UK Bratislava
+ŠH pri ZŠ s MŠ Želiarska Košice = ŠH Želiarska Košice
+Športová hala EUBA = ŠH EUBA Bratislava
+Športové centrum Žilinskej univerzity = ŠC ŽU Žilina
