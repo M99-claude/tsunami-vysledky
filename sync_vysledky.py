@@ -324,7 +324,7 @@ def admin_request(opener, url, data=None):
     return page
 
 
-def admin_ajax(opener, name, params):
+def admin_ajax(opener, name, params, check_ok=True):
     if not _csrf["token"]:
         admin_request(opener, ADMIN_STANDINGS)
     page = admin_request(opener, f"{ADMIN_BASE}/ajax/{name}.php",
@@ -333,9 +333,24 @@ def admin_ajax(opener, name, params):
         result = json.loads(page)
     except ValueError:
         sys.exit(f"Neocakavana odpoved z ajax/{name}.php")
-    if not result.get("ok"):
+    if check_ok and not result.get("ok"):
         sys.exit(f"Chyba z ajax/{name}.php: {result.get('error')}")
     return result
+
+
+def clear_web_cache(opener):
+    """To iste ako tlacidlo 'Promazat webovou cache' v admine."""
+    page = admin_request(opener, ADMIN_STANDINGS)
+    btn = page.find('id="clearWebCacheBtn"')
+    hashes = re.findall(r"hash:\s*'([^']+)'", page[:btn] if btn >= 0 else "")
+    if not hashes:
+        log("CHYBA: v admine sa nenaslo tlacidlo na premazanie cache webu.")
+        return
+    result = admin_ajax(opener, "clear_web_cache", {"hash": hashes[-1]}, check_ok=False)
+    for url in result.get("cleared") or []:
+        log(f"Cache webu premazana: {url}")
+    for err in result.get("errors") or []:
+        log(f"CHYBA pri mazani cache {err.get('url')}: {err.get('error')}")
 
 
 # --- Zapasy ------------------------------------------------------------------
@@ -525,7 +540,9 @@ def main():
         changed += sync_standings(opener, results_page, args.apply)
         if changed == 0:
             log("Vsetko je aktualne.")
-        elif not args.apply:
+        elif args.apply:
+            clear_web_cache(opener)
+        else:
             log(f"{changed} zmien na zapis. Spusti s --apply pre zapis.")
     finally:
         jar.save(ignore_discard=True)
