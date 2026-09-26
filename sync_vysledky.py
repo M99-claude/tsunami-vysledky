@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Synchronizácia výsledkov zápasov zo szfb.sk do administrácie klubového webu (eoscms).
+"""Synchronizacia vysledkov zapasov a ligovej tabulky zo szfb.sk do administracie
+kluboveho webu (eoscms).
 
-Použitie:
-    python3 sync_vysledky.py            # len ukáže, čo by sa zmenilo (nič nezapisuje)
-    python3 sync_vysledky.py --apply    # zapíše zmeny do adminu
+Pouzitie:
+    python3 sync_vysledky.py            # len ukaze, co by sa zmenilo (nic nezapisuje)
+    python3 sync_vysledky.py --apply    # zapise zmeny do adminu
 
-Prihlasovacie údaje sa čítajú z premenných prostredia EOS_EMAIL a EOS_PASSWORD
-(na GitHube z Secrets), alebo z macOS Keychain (služba "tsunami-eoscms"):
+Prihlasovacie udaje sa citaju z premennych prostredia EOS_EMAIL a EOS_PASSWORD
+(na GitHube z Secrets), alebo z macOS Keychain (sluzba "tsunami-eoscms"):
     security add-generic-password -s tsunami-eoscms -a "EMAIL" -w
 """
 
 import argparse
 import html
 import http.cookiejar
+import json
 import os
 import re
 import subprocess
@@ -25,13 +27,17 @@ from html.parser import HTMLParser
 # --- Nastavenia --------------------------------------------------------------
 
 SZFB_BASE = "https://www.szfb.sk"
-# Florbalová extraliga mužov 2026/2027 (TournamentID na szfb.sk)
+# Florbalova extraliga muzov 2026/2027 (TournamentID na szfb.sk)
 SZFB_RESULTS = SZFB_BASE + "/sk/stats/results/1241/florbalova-extraliga-muzov"
+SZFB_STANDINGS = SZFB_BASE + "/sk/stats/standings/1241/florbalova-extraliga-muzov"
 SZFB_OUR_ABBR = "TSU"
 
 ADMIN_BASE = "https://tsunamiflorbal.eoscms.cz"
 ADMIN_SEASON_ID = 3   # 2026/2027
-ADMIN_TEAM_ID = 25    # Muži
+ADMIN_TEAM_ID = 25    # Muzi
+ADMIN_FILTER = f"sid={ADMIN_SEASON_ID}&tid={ADMIN_TEAM_ID}"
+ADMIN_GAMES = f"{ADMIN_BASE}/games/?{ADMIN_FILTER}&dataview=games_all"
+ADMIN_STANDINGS = f"{ADMIN_BASE}/games/standings/?{ADMIN_FILTER}"
 
 KEYCHAIN_SERVICE = "tsunami-eoscms"
 STATE_DIR = os.path.expanduser("~/Library/Application Support/tsunami-vysledky")
@@ -39,19 +45,22 @@ COOKIE_FILE = os.path.join(STATE_DIR, "session.cookies")
 
 USER_AGENT = "Mozilla/5.0 (Macintosh) tsunami-vysledky/1.0"
 
-# szfb označenie -> hodnota "Hrací doba" v admine
+# szfb oznacenie -> hodnota "Hraci doba" v admine
 RESULT_TYPE = {"": "", "pp": "p", "sn": "pn"}
 STATUS_PLAYED = "2"
+
+# stlpce tabulky: poradie na szfb.sk (Z, V, Vp, R, Pp, P) -> polia v admine
+STANDINGS_FIELDS = ["gp", "gw", "gwot", "gt", "glot", "gl"]
 
 
 def log(msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
-# --- Keychain ----------------------------------------------------------------
+# --- Prihlasovacie udaje -----------------------------------------------------
 
 def credentials():
-    """Vráti (email, heslo) z premenných prostredia (GitHub Secrets), inak z macOS Keychain."""
+    """Vrati (email, heslo) z premennych prostredia (GitHub Secrets), inak z macOS Keychain."""
     email, password = os.environ.get("EOS_EMAIL"), os.environ.get("EOS_PASSWORD")
     if email and password:
         return email, password
@@ -63,12 +72,12 @@ def credentials():
             ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
             capture_output=True, text=True, check=True).stdout.rstrip("\n")
     except (subprocess.CalledProcessError, FileNotFoundError):
-        sys.exit("Chýbajú prihlasovacie údaje: nastav EOS_EMAIL a EOS_PASSWORD, "
-                 f"alebo na Macu pridaj položku '{KEYCHAIN_SERVICE}' do Keychain:\n"
+        sys.exit("Chybaju prihlasovacie udaje: nastav EOS_EMAIL a EOS_PASSWORD, "
+                 f"alebo na Macu pridaj polozku '{KEYCHAIN_SERVICE}' do Keychain:\n"
                  f'  security add-generic-password -s {KEYCHAIN_SERVICE} -a "EMAIL" -w')
     m = re.search(r'"acct"<blob>="([^"]*)"', attrs)
     if not m:
-        sys.exit("V Keychain položke chýba účet (email).")
+        sys.exit("V Keychain polozke chyba ucet (email).")
     return m.group(1), password
 
 
@@ -81,23 +90,24 @@ def make_opener(jar):
 
 
 def fetch(opener, url, data=None):
-    """Vráti (finálna URL po presmerovaní, text)."""
+    """Vrati (finalna URL po presmerovani, text). `data` je dict alebo zoznam dvojic."""
     body = urllib.parse.urlencode(data).encode() if data is not None else None
     with opener.open(url, body, timeout=30) as resp:
         return resp.geturl(), resp.read().decode("utf-8", errors="replace")
 
 
+def cells(row):
+    """Textovy obsah buniek riadku tabulky."""
+    return [" ".join(html.unescape(re.sub(r"<[^>]+>", " ", c)).split())
+            for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, re.S)]
+
+
 # --- szfb.sk -----------------------------------------------------------------
 
-def text_of(fragment):
-    return html.unescape(re.sub(r"<[^>]+>", " ", fragment)).split()
-
-
-def szfb_matches(opener):
-    """Vráti {kód zápasu: údaje} pre odohrané zápasy nášho tímu."""
-    _, page = fetch(opener, SZFB_RESULTS)
+def szfb_matches(results_page):
+    """Vrati {kod zapasu: udaje} pre odohrane zapasy nasho timu."""
     result = {}
-    for row in page.split('<tr class="fn-tap-row')[1:]:
+    for row in results_page.split('<tr class="fn-tap-row')[1:]:
         code = re.search(r'<td class="hidden-xs ">\s*(\d+)\s*</td>', row)
         abbrs = re.findall(r'<span class="visible-xs competitor-img">.*?>\s*([^<\s]+)\s*</span>', row, re.S)
         score_box = re.search(r'<div class="game-clash-result text-center hidden-xs">(.*?)</div>', row, re.S)
@@ -105,7 +115,7 @@ def szfb_matches(opener):
             continue
         goals = re.findall(r'<span class="matchresult">(\d+)</span>', score_box.group(1))
         if len(goals) != 2:
-            continue  # ešte neodohraný
+            continue  # este neodohrany
         marker = re.search(r'font-small">(pp|sn)</span>', score_box.group(1))
         link = re.search(r'href="(/sk/stats/matches/[^"]+/match/\d+)"', score_box.group(1))
         result[code.group(1)] = {
@@ -125,45 +135,72 @@ def szfb_periods(opener, match_url):
     return html.unescape(m.group(1)).strip() if m else ""
 
 
+def szfb_team_abbrs(results_page):
+    """Vrati {ID timu na szfb.sk: skratka} zo stranky vysledkov."""
+    return dict(re.findall(
+        r'<span class="visible-xs competitor-img">\s*<img src="[^"]*/Competitor/(\d+)/[^>]*>\s*([^<\s]+)\s*</span>',
+        results_page))
+
+
+def szfb_standings(opener, abbrs):
+    """Vrati tabulku ako zoznam riadkov v poradi: {abbr, name, gp, ..., points}."""
+    _, page = fetch(opener, SZFB_STANDINGS)
+    table = re.search(r"<table.*?</table>", page, re.S)
+    rows = []
+    for row in re.findall(r"<tr>.*?</tr>", table.group(0) if table else "", re.S):
+        team = re.search(r"/team/(\d+)/", row)
+        c = cells(row)
+        if not team or len(c) != 10:
+            continue
+        scored, conceded = c[8].split(":")
+        entry = {"abbr": abbrs.get(team.group(1)), "name": c[1],
+                 "score_h": scored.strip(), "score_a": conceded.strip(), "points": c[9]}
+        entry.update(zip(STANDINGS_FIELDS, c[2:8]))
+        rows.append(entry)
+    return rows
+
+
 # --- eoscms admin ------------------------------------------------------------
 
 class FormParser(HTMLParser):
-    """Zozbiera polia formulára na úpravu zápasu tak, ako by ich odoslal prehliadač."""
+    """Zozbiera polia prveho formulara, ktory vyhovuje `match(attrs)`,
+    tak, ako by ich odoslal prehliadac."""
 
-    def __init__(self):
+    def __init__(self, match):
         super().__init__(convert_charrefs=True)
+        self.match = match
+        self.found = False
         self.action = None
-        self.fields = []          # [(name, value)] v poradí
+        self.fields = []          # [(name, value)] v poradi
         self._in_form = False
         self._select = None       # [name, first_value, selected_value]
-        self._option_value = None
         self._textarea = None     # [name, text]
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
-        if tag == "form" and "game_update.php" in (a.get("action") or ""):
-            self._in_form = True
-            self.action = a["action"]
-        if not self._in_form or not a.get("name") and tag not in ("option",):
+        if tag == "form" and not self.found and self.match(a):
+            self._in_form = self.found = True
+            self.action = a.get("action")
             return
-        if tag == "input":
+        if not self._in_form:
+            return
+        if tag == "input" and a.get("name"):
             itype = (a.get("type") or "text").lower()
             if itype in ("checkbox", "radio"):
                 if "checked" in a:
                     self.fields.append((a["name"], a.get("value", "on")))
             elif itype not in ("submit", "button", "file", "image", "reset"):
                 self.fields.append((a["name"], a.get("value", "")))
-        elif tag == "select":
+        elif tag == "select" and a.get("name"):
             self._select = [a["name"], None, None]
         elif tag == "option" and self._select is not None:
             value = a.get("value")
-            self._option_value = value
             if value is not None:
                 if self._select[1] is None:
                     self._select[1] = value
                 if "selected" in a:
                     self._select[2] = value
-        elif tag == "textarea":
+        elif tag == "textarea" and a.get("name"):
             self._textarea = [a["name"], ""]
 
     def handle_data(self, data):
@@ -182,47 +219,18 @@ class FormParser(HTMLParser):
             self._textarea = None
 
 
-def is_login_page(url):
-    return urllib.parse.urlparse(url).path.rstrip("/") == "/login"
+def parse_form(page, match):
+    parser = FormParser(match)
+    parser.feed(page)
+    return parser if parser.found else None
 
 
-def admin_login(opener):
-    email, password = credentials()
-    _, page = fetch(opener, ADMIN_BASE + "/login")
-    token = re.search(r'name="csrf_token" value="([^"]+)"', page)
-    if not token:
-        sys.exit("Na prihlasovacej stránke sa nenašiel CSRF token.")
-    url, _ = fetch(opener, ADMIN_BASE + "/login",
-                   {"csrf_token": token.group(1), "email": email, "password": password})
-    if is_login_page(url):
-        sys.exit("Prihlásenie do adminu zlyhalo (skontroluj email/heslo v Keychain).")
-    log("Prihlásený do adminu.")
+def is_game_form(attrs):
+    return "game_update.php" in (attrs.get("action") or "")
 
 
-def admin_get(opener, url):
-    """GET v admine; ak session vypršala, prihlási sa znova a zopakuje požiadavku."""
-    final_url, page = fetch(opener, url)
-    if is_login_page(final_url):
-        log("Session vypršala alebo neexistuje – prihlasujem sa.")
-        admin_login(opener)
-        final_url, page = fetch(opener, url)
-        if is_login_page(final_url):
-            sys.exit("Ani po prihlásení sa nepodarilo otvoriť admin.")
-    return page
-
-
-def admin_games(opener):
-    list_url = (f"{ADMIN_BASE}/games/?sid={ADMIN_SEASON_ID}&tid={ADMIN_TEAM_ID}"
-                "&dataview=games_all")
-    page = admin_get(opener, list_url)
-    ids = list(dict.fromkeys(re.findall(r'/games/\?id=(\d+)"', page)))
-    games = []
-    for game_id in ids:
-        parser = FormParser()
-        parser.feed(admin_get(opener, f"{ADMIN_BASE}/games/?id={game_id}"))
-        if parser.action:
-            games.append({"id": game_id, "action": parser.action, "fields": parser.fields})
-    return games
+def is_standings_form(attrs):
+    return attrs.get("id") == "games-standings"
 
 
 def field(fields, name):
@@ -236,11 +244,187 @@ def with_changes(fields, changes):
     return [(n, changes.get(n, v)) for n, v in fields]
 
 
-# --- Hlavná logika -----------------------------------------------------------
+def is_login_page(url):
+    return urllib.parse.urlparse(url).path.rstrip("/") == "/login"
+
+
+def admin_login(opener):
+    email, password = credentials()
+    _, page = fetch(opener, ADMIN_BASE + "/login")
+    token = re.search(r'name="csrf_token" value="([^"]+)"', page)
+    if not token:
+        sys.exit("Na prihlasovacej stranke sa nenasiel CSRF token.")
+    url, _ = fetch(opener, ADMIN_BASE + "/login",
+                   {"csrf_token": token.group(1), "email": email, "password": password})
+    if is_login_page(url):
+        sys.exit("Prihlasenie do adminu zlyhalo (skontroluj email/heslo).")
+    log("Prihlaseny do adminu.")
+
+
+_csrf = {"token": None}  # token z <meta name="csrf-token">, potrebny pre ajax volania
+
+
+def admin_request(opener, url, data=None):
+    """Poziadavka do adminu; ak session vyprsala, prihlasi sa znova a zopakuje ju."""
+    final_url, page = fetch(opener, url, data)
+    if is_login_page(final_url):
+        log("Session vyprsala alebo neexistuje - prihlasujem sa.")
+        admin_login(opener)
+        final_url, page = fetch(opener, url, data)
+        if is_login_page(final_url):
+            sys.exit("Ani po prihlaseni sa nepodarilo otvorit admin.")
+    meta = re.search(r'<meta name="csrf-token" content="([^"]+)"', page)
+    if meta:
+        _csrf["token"] = meta.group(1)
+    return page
+
+
+def admin_ajax(opener, name, params):
+    if not _csrf["token"]:
+        admin_request(opener, ADMIN_STANDINGS)
+    page = admin_request(opener, f"{ADMIN_BASE}/ajax/{name}.php",
+                         dict(params, csrf_token=_csrf["token"]))
+    try:
+        result = json.loads(page)
+    except ValueError:
+        sys.exit(f"Neocakavana odpoved z ajax/{name}.php")
+    if not result.get("ok"):
+        sys.exit(f"Chyba z ajax/{name}.php: {result.get('error')}")
+    return result
+
+
+# --- Zapasy ------------------------------------------------------------------
+
+def admin_game_form(opener, game_id):
+    return parse_form(admin_request(opener, f"{ADMIN_BASE}/games/?id={game_id}"), is_game_form)
+
+
+def sync_games(opener, results_page, apply):
+    szfb = szfb_matches(results_page)
+    log(f"szfb.sk: {len(szfb)} odohranych zapasov Tsunami.")
+    ids = list(dict.fromkeys(re.findall(r'/games/\?id=(\d+)"', admin_request(opener, ADMIN_GAMES))))
+    log(f"Admin: {len(ids)} zapasov.")
+
+    changed = 0
+    for game_id in ids:
+        form = admin_game_form(opener, game_id)
+        if not form:
+            continue
+        f = form.fields
+        src = szfb.get(field(f, "kod"))
+        if not src:
+            continue
+        label = f"zapas #{field(f, 'kod')} {field(f, 'domaci_kratky')} - {field(f, 'hoste_kratky')}"
+
+        # kontrola, ze domaci/hostia su v oboch systemoch rovnako
+        our_side = field(f, "nas_tym")
+        expected = src["home_abbr"] if our_side == "d" else src["away_abbr"] if our_side == "h" else None
+        if expected is not None and expected != SZFB_OUR_ABBR:
+            log(f"PRESKAKUJEM {label}: nesedi domaci/hostia medzi szfb.sk a adminom.")
+            continue
+
+        wanted = {
+            "score_home": src["score_home"],
+            "score_away": src["score_away"],
+            "vysledek_typ": src["result_type"],
+            "game_status": STATUS_PLAYED,
+        }
+        periods = szfb_periods(opener, src["url"]) if src["url"] else ""
+        if periods:
+            wanted["tretiny"] = periods
+        diff = {k: v for k, v in wanted.items() if (field(f, k) or "") != v}
+        if not diff:
+            continue
+
+        changed += 1
+        desc = ", ".join(f"{k}: '{field(f, k) or ''}' -> '{v}'" for k, v in diff.items())
+        if not apply:
+            log(f"[nahlad] {label}: {desc}")
+            continue
+
+        admin_request(opener, form.action, with_changes(f, diff) + [("submit_with_return", "")])
+        check = admin_game_form(opener, game_id)
+        bad = [k for k, v in diff.items() if not check or (field(check.fields, k) or "") != v]
+        log(f"CHYBA {label}: po ulozeni nesedi {', '.join(bad)}" if bad
+            else f"Aktualizovane {label}: {desc}")
+    return changed
+
+
+# --- Tabulka -----------------------------------------------------------------
+
+def admin_standings(opener):
+    """Vrati riadky tabulky v admine v aktualnom poradi: [{id, abbr}]."""
+    page = admin_request(opener, ADMIN_STANDINGS)
+    rows = []
+    for row_id, body in re.findall(r'<tr id="row-standings-(\d+)"(.*?)</tr>', page, re.S):
+        team = re.search(r'team_name">.*?<div class="text-xs[^"]*">([^<]*)</div>', body, re.S)
+        abbr = html.unescape(team.group(1)).rsplit(" - ", 1)[-1].strip() if team else None
+        rows.append({"id": row_id, "abbr": abbr})
+    return rows
+
+
+def admin_standings_form(opener, row_id):
+    result = admin_ajax(opener, "get_modal", {
+        "module": "games", "entity": "standings", "id": row_id,
+        "payload": "", "url_back_params": ADMIN_FILTER})
+    return parse_form(result.get("data", ""), is_standings_form)
+
+
+def sync_standings(opener, results_page, apply):
+    source = szfb_standings(opener, szfb_team_abbrs(results_page))
+    admin = admin_standings(opener)
+    log(f"Tabulka: szfb.sk {len(source)} timov, admin {len(admin)} timov.")
+    by_abbr = {r["abbr"]: r for r in admin}
+
+    unmatched = [s["name"] for s in source if s["abbr"] not in by_abbr]
+    if unmatched or len(source) != len(admin):
+        log(f"PRESKAKUJEM tabulku: nepodarilo sa sparovat timy {unmatched or ''} "
+            f"(szfb.sk {len(source)}, admin {len(admin)}).")
+        return 0
+
+    changed = 0
+    for src in source:
+        row = by_abbr[src["abbr"]]
+        form = admin_standings_form(opener, row["id"])
+        if not form:
+            log(f"CHYBA tabulka {src['abbr']}: nenasiel sa formular.")
+            continue
+        wanted = {k: src[k] for k in STANDINGS_FIELDS + ["score_h", "score_a", "points"]}
+        diff = {k: v for k, v in wanted.items() if (field(form.fields, k) or "") != v}
+        if not diff:
+            continue
+        changed += 1
+        desc = ", ".join(f"{k}: {field(form.fields, k)} -> {v}" for k, v in diff.items())
+        if not apply:
+            log(f"[nahlad] tabulka {src['abbr']}: {desc}")
+            continue
+        admin_request(opener, ADMIN_STANDINGS, with_changes(form.fields, diff))
+        check = admin_standings_form(opener, row["id"])
+        bad = [k for k, v in diff.items() if not check or (field(check.fields, k) or "") != v]
+        log(f"CHYBA tabulka {src['abbr']}: po ulozeni nesedi {', '.join(bad)}" if bad
+            else f"Aktualizovana tabulka {src['abbr']}: {desc}")
+
+    wanted_order = [by_abbr[s["abbr"]]["id"] for s in source]
+    if wanted_order != [r["id"] for r in admin]:
+        changed += 1
+        order_desc = " ".join(s["abbr"] for s in source)
+        if not apply:
+            log(f"[nahlad] poradie tabulky: {order_desc}")
+        else:
+            admin_ajax(opener, "sortable_save", {
+                "module": "games", "entity": "standings", "view": "standings",
+                "items": json.dumps(wanted_order)})
+            now = [r["id"] for r in admin_standings(opener)]
+            log(f"Aktualizovane poradie tabulky: {order_desc}" if now == wanted_order
+                else "CHYBA: poradie tabulky sa po ulozeni nezmenilo.")
+    return changed
+
+
+# --- Hlavna logika -----------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--apply", action="store_true", help="naozaj zapísať zmeny do adminu")
+    ap.add_argument("--apply", action="store_true", help="naozaj zapisat zmeny do adminu")
     args = ap.parse_args()
 
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
@@ -250,64 +434,13 @@ def main():
     opener = make_opener(jar)
 
     try:
-        szfb = szfb_matches(opener)
-        log(f"szfb.sk: {len(szfb)} odohraných zápasov Tsunami.")
-        games = admin_games(opener)
-        log(f"Admin: {len(games)} zápasov.")
-
-        changed = 0
-        for game in games:
-            f = game["fields"]
-            code = field(f, "kod")
-            src = szfb.get(code)
-            if not src:
-                continue
-            label = f"#{code} {field(f, 'domaci_kratky')} – {field(f, 'hoste_kratky')}"
-
-            # kontrola, že domáci/hostia sú v oboch systémoch rovnako
-            our_side = field(f, "nas_tym")
-            expected = src["home_abbr"] if our_side == "d" else src["away_abbr"] if our_side == "h" else None
-            if expected is not None and expected != SZFB_OUR_ABBR:
-                log(f"PRESKAKUJEM {label}: nesedí domáci/hostia medzi szfb.sk a adminom.")
-                continue
-
-            src["periods"] = szfb_periods(opener, src["url"]) if src["url"] else ""
-            wanted = {
-                "score_home": src["score_home"],
-                "score_away": src["score_away"],
-                "vysledek_typ": src["result_type"],
-                "game_status": STATUS_PLAYED,
-            }
-            if src["periods"]:
-                wanted["tretiny"] = src["periods"]
-            diff = {k: v for k, v in wanted.items() if (field(f, k) or "") != v}
-            if not diff:
-                continue
-
-            changed += 1
-            desc = ", ".join(f"{k}: '{field(f, k) or ''}' → '{v}'" for k, v in diff.items())
-            if not args.apply:
-                log(f"[náhľad] {label}: {desc}")
-                continue
-
-            post = with_changes(f, diff) + [("submit_with_return", "")]
-            body = urllib.parse.urlencode(post).encode()
-            with opener.open(game["action"], body, timeout=30) as resp:
-                if is_login_page(resp.geturl()):
-                    sys.exit("Session vypršala počas zápisu – spusti znova.")
-            # overenie
-            check = FormParser()
-            check.feed(admin_get(opener, f"{ADMIN_BASE}/games/?id={game['id']}"))
-            bad = [k for k, v in diff.items() if (field(check.fields, k) or "") != v]
-            if bad:
-                log(f"CHYBA {label}: po uložení nesedí {', '.join(bad)}")
-            else:
-                log(f"Aktualizované {label}: {desc}")
-
+        _, results_page = fetch(opener, SZFB_RESULTS)
+        changed = sync_games(opener, results_page, args.apply)
+        changed += sync_standings(opener, results_page, args.apply)
         if changed == 0:
-            log("Všetko je aktuálne.")
+            log("Vsetko je aktualne.")
         elif not args.apply:
-            log(f"{changed} zápas(ov) na aktualizáciu. Spusti s --apply pre zápis.")
+            log(f"{changed} zmien na zapis. Spusti s --apply pre zapis.")
     finally:
         jar.save(ignore_discard=True)
         os.chmod(COOKIE_FILE, 0o600)
