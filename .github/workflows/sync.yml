@@ -3,13 +3,13 @@ name: Aktualizacia vysledkov
 on:
   schedule:
     # Casy su v UTC (Slovensko = UTC+2 v lete, UTC+1 v zime).
-    # So-Ne: kazdych 20 minut medzi 7:00 a 22:59 UTC (v lete 9:00-00:40, v zime 8:00-23:40)
+    # Minuty su zamerne mimo :00/:20/:40 - GitHub naplanovane behy okolo celych
+    # hodin pri zatazi casto vynechava.
+    # So-Ne: kazdych 20 minut medzi 7:00 a 22:59 UTC (v lete 9:07-00:47, v zime 8:07-23:47)
     #        - mladez hra cez vikend aj dopoludnia
-    - cron: "*/20 7-22 * * 6,0"
-    # Pia: kazdych 20 minut medzi 12:00 a 22:59 UTC
-    - cron: "*/20 12-22 * * 5"
-    # Po-St: raz za hodinu vecer (zapasy cez tyzden)
-    - cron: "5 16-22 * * 1-4"
+    - cron: "7,27,47 7-22 * * 6,0"
+    # Po-Pia: raz za hodinu vecer (zapasy cez tyzden)
+    - cron: "17 16-22 * * 1-5"
   workflow_dispatch:
     inputs:
       apply:
