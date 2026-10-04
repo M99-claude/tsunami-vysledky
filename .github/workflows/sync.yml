@@ -1,15 +1,8 @@
 name: Aktualizacia vysledkov
 
 on:
-  schedule:
-    # Casy su v UTC (Slovensko = UTC+2 v lete, UTC+1 v zime).
-    # Minuty su zamerne mimo :00/:20/:40 - GitHub naplanovane behy okolo celych
-    # hodin pri zatazi casto vynechava.
-    # So-Ne: kazdych 20 minut medzi 7:00 a 22:59 UTC (v lete 9:07-00:47, v zime 8:07-23:47)
-    #        - mladez hra cez vikend aj dopoludnia
-    - cron: "7,27,47 7-22 * * 6,0"
-    # Po-Pia: raz za hodinu vecer (zapasy cez tyzden)
-    - cron: "17 16-22 * * 1-5"
+  # Behy spusta externe cron-job.org cez GitHub API (workflow_dispatch s apply=true).
+  # Vlastny casovac GitHubu (schedule) sa nepouziva - naplanovane behy casto vynechaval.
   workflow_dispatch:
     inputs:
       apply:
@@ -32,7 +25,7 @@ jobs:
           EOS_EMAIL: ${{ secrets.EOS_EMAIL }}
           EOS_PASSWORD: ${{ secrets.EOS_PASSWORD }}
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.apply }}" = "true" ]; then
+          if [ "${{ inputs.apply }}" = "true" ]; then
             python3 sync_vysledky.py --apply
           else
             python3 sync_vysledky.py
