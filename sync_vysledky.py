@@ -40,11 +40,18 @@ class Competition:
     Ak je liga na szfb.sk rozdelena do divizii, kazda divizia je samostatna sutaz v admine:
     szfb_part = TournamentPartID divizie, admin_cid = ID sutaze v admine. Zoznam zapasov
     v admine sa podla sutaze filtrovat neda, preto zapasy synchronizuje len jedna z divizii
-    (games=True) a ostatne len tabulku."""
+    (games=True) a ostatne len tabulku.
 
-    def __init__(self, name, szfb_id, szfb_slug, admin_team_id, szfb_part=None, admin_cid=None, games=True):
+    scores=False: sutaz bez zapisu skore (pripravka - szfb.sk uvadza pri vsetkych
+    zapasoch 0:0), aktualizuje sa len program. Stav "odehrano" admin bez skore
+    neulozi (urcuje ho sam podla udajov zapasu), preto zapasy ostavaju "naplanovane". standings=False: sutaz bez tabulky."""
+
+    def __init__(self, name, szfb_id, szfb_slug, admin_team_id, szfb_part=None, admin_cid=None,
+                 games=True, scores=True, standings=True):
         self.name = name
         self.games = games
+        self.scores = scores
+        self.with_standings = standings
         self.results = f"{SZFB_BASE}/sk/stats/results/{szfb_id}/{szfb_slug}"
         self.standings = f"{SZFB_BASE}/sk/stats/standings/{szfb_id}/{szfb_slug}"
         if szfb_part:
@@ -76,6 +83,13 @@ COMPETITIONS = [
                 szfb_part=4859, admin_cid=43, games=False),
     Competition("Liga mladsich ziakov - Biela divizia", 1279, "liga-mladsich-ziakov-bratislava", 22,
                 szfb_part=4860, admin_cid=44, games=False),
+    # pripravka: bez tabulky (tim Tsunami ZB Modri); skore zo szfb.sk (0:0) sa zapisuje,
+    # aby boli odohrane zapasy v stave "odehrano" - rozhodnutie pouzivatela 2026-10-13
+    Competition("Liga starsej pripravky", 1289, "liga-starsej-pripravky-bratislava", 20,
+                standings=False),
+    # mladsia pripravka: rovnako ako starsia - bez tabulky, skore zo szfb.sk
+    Competition("Liga mladsej pripravky", 1288, "liga-mladsej-pripravky-bratislava", 19,
+                standings=False),
 ]
 
 PLACES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "miesta.txt")
@@ -334,6 +348,10 @@ def is_login_page(url, page=""):
 
 def admin_login(opener):
     email, password = credentials()
+    # so starou (vyprsanou) session admin nevrati prihlasovaci formular
+    for handler in opener.handlers:
+        if isinstance(handler, urllib.request.HTTPCookieProcessor):
+            handler.cookiejar.clear()
     _, page = fetch(opener, ADMIN_BASE + "/login")
     token = re.search(r'name="csrf_token" value="([^"]+)"', page)
     if not token:
@@ -471,7 +489,7 @@ def sync_games(opener, comp, results_page, apply):
             continue
 
         wanted = schedule_changes(f, src)
-        if src["score_home"] is not None:
+        if src["score_home"] is not None and comp.scores:
             wanted.update({
                 "score_home": src["score_home"],
                 "score_away": src["score_away"],
@@ -616,7 +634,8 @@ def main():
             _, results_page = fetch(opener, comp.results)
             if comp.games:
                 changed += sync_games(opener, comp, results_page, args.apply)
-            changed += sync_standings(opener, comp, results_page, args.apply)
+            if comp.with_standings:
+                changed += sync_standings(opener, comp, results_page, args.apply)
         if changed == 0:
             log("Vsetko je aktualne.")
         elif args.apply:
