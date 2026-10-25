@@ -83,6 +83,16 @@ COMPETITIONS = [
                 szfb_part=4859, admin_cid=43, games=False),
     Competition("Liga mladsich ziakov - Biela divizia", 1279, "liga-mladsich-ziakov-bratislava", 22,
                 szfb_part=4860, admin_cid=44, games=False),
+    # 2. kolo (od 24.10.2026): Heroes v zelenej, Surfers v cervenej; zlta a biela
+    # maju tabulky z pomocnych skrytych zapasov
+    Competition("Liga mladsich ziakov - Zelena divizia 2. kolo", 1279, "liga-mladsich-ziakov-bratislava", 22,
+                szfb_part=4896, admin_cid=45, games=False),
+    Competition("Liga mladsich ziakov - Zlta divizia 2. kolo", 1279, "liga-mladsich-ziakov-bratislava", 22,
+                szfb_part=4897, admin_cid=47, games=False),
+    Competition("Liga mladsich ziakov - Cervena divizia 2. kolo", 1279, "liga-mladsich-ziakov-bratislava", 22,
+                szfb_part=4898, admin_cid=46, games=False),
+    Competition("Liga mladsich ziakov - Biela divizia 2. kolo", 1279, "liga-mladsich-ziakov-bratislava", 22,
+                szfb_part=4899, admin_cid=48, games=False),
     # pripravka: bez tabulky (tim Tsunami ZB Modri); skore zo szfb.sk (0:0) sa zapisuje,
     # aby boli odohrane zapasy v stave "odehrano" - rozhodnutie pouzivatela 2026-10-13
     Competition("Liga starsej pripravky", 1289, "liga-starsej-pripravky-bratislava", 20,
@@ -411,11 +421,16 @@ def clear_web_cache(opener):
     """To iste ako tlacidlo 'Promazat webovou cache' v admine."""
     page = admin_request(opener, ADMIN_DASHBOARD)
     btn = page.find('id="clearWebCacheBtn"')
-    hashes = re.findall(r"hash:\s*'([^']+)'", page[:btn] if btn >= 0 else "")
-    if not hashes:
+    if btn < 0:
         log("CHYBA: v admine sa nenaslo tlacidlo na premazanie cache webu.")
         return
-    result = admin_ajax(opener, "clear_web_cache", {"hash": hashes[-1]}, check_ok=False)
+    # Starsia verzia adminu posielala "hash" z tlacidla, novsia (od 10/2026) len CSRF token.
+    hashes = re.findall(r"hash:\s*'([^']+)'", page[:btn])
+    params = {"hash": hashes[-1]} if hashes else {}
+    result = admin_ajax(opener, "clear_web_cache", params, check_ok=False)
+    if result.get("ok") == 0:
+        log(f"CHYBA pri mazani cache: {result.get('error')}")
+        return
     for url in result.get("cleared") or []:
         log(f"Cache webu premazana: {url}")
     for err in result.get("errors") or []:
