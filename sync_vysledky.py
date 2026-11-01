@@ -504,6 +504,10 @@ def sync_games(opener, comp, results_page, apply):
             continue
 
         wanted = schedule_changes(f, src)
+        # program zapasov na webe zobrazuje len zapasy s urcenym nasim timom; doplnit,
+        # ak chyba a je jednoznacny (vzajomne zapasy A-B sa nastavuju rucne na tim A)
+        if not our_side and (src["home_abbr"] == SZFB_OUR_ABBR) != (src["away_abbr"] == SZFB_OUR_ABBR):
+            wanted["nas_tym"] = "d" if src["home_abbr"] == SZFB_OUR_ABBR else "h"
         if src["score_home"] is not None and comp.scores:
             wanted.update({
                 "score_home": src["score_home"],
