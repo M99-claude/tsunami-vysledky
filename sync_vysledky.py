@@ -13,12 +13,14 @@ Prihlasovacie udaje sa citaju z premennych prostredia EOS_EMAIL a EOS_PASSWORD
 
 import argparse
 import html
+import http.client
 import http.cookiejar
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -109,6 +111,12 @@ STATE_DIR = os.path.expanduser("~/Library/Application Support/tsunami-vysledky")
 COOKIE_FILE = os.path.join(STATE_DIR, "session.cookies")
 
 USER_AGENT = "Mozilla/5.0 (Macintosh) tsunami-vysledky/1.0"
+TIMEOUT = 60   # sekund na jednu poziadavku
+# Mazanie cache trva v admine 8-120 s: caka aj na nahladovy web, ktory byva nedostupny
+CACHE_TIMEOUT = 150
+CACHE_ATTEMPTS = 2
+# OSError pokryva aj socket.timeout, URLError a ConnectionError
+NETWORK_ERRORS = (OSError, http.client.HTTPException)
 
 # szfb oznacenie -> hodnota "Hraci doba" v admine
 RESULT_TYPE = {"": "", "pp": "p", "sn": "pn"}
@@ -158,11 +166,21 @@ def make_opener(jar):
     return opener
 
 
-def fetch(opener, url, data=None):
+def fetch(opener, url, data=None, timeout=None):
     """Vrati (finalna URL po presmerovani, text). `data` je dict alebo zoznam dvojic."""
     body = urllib.parse.urlencode(data).encode() if data is not None else None
-    with opener.open(url, body, timeout=30) as resp:
-        return resp.geturl(), resp.read().decode("utf-8", errors="replace")
+    # szfb.sk obcas odpoveda aj desiatky sekund; citanie (GET) sa da bezpecne zopakovat,
+    # zapis (POST) nie - mohol by sa vykonat dvakrat
+    attempts = 3 if body is None else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            with opener.open(url, body, timeout=timeout or TIMEOUT) as resp:
+                return resp.geturl(), resp.read().decode("utf-8", errors="replace")
+        except NETWORK_ERRORS as exc:
+            if attempt == attempts:
+                raise
+            log(f"Pokus {attempt}/{attempts} o {url} zlyhal ({exc}), skusam znova.")
+            time.sleep(5 * attempt)
 
 
 def cells(row):
@@ -427,14 +445,28 @@ def clear_web_cache(opener):
     # Starsia verzia adminu posielala "hash" z tlacidla, novsia (od 10/2026) len CSRF token.
     hashes = re.findall(r"hash:\s*'([^']+)'", page[:btn])
     params = {"hash": hashes[-1]} if hashes else {}
-    result = admin_ajax(opener, "clear_web_cache", params, check_ok=False)
-    if result.get("ok") == 0:
-        log(f"CHYBA pri mazani cache: {result.get('error')}")
+    params["csrf_token"] = _csrf["token"]
+    # Vsetky zapisy su v tejto chvili hotove, zlyhanie mazania preto nezhodi cely beh.
+    for attempt in range(1, CACHE_ATTEMPTS + 1):
+        try:
+            _, body = fetch(opener, f"{ADMIN_BASE}/ajax/clear_web_cache.php", params, timeout=CACHE_TIMEOUT)
+            result = json.loads(body)
+            break
+        except (*NETWORK_ERRORS, ValueError) as exc:
+            log(f"Pokus {attempt}/{CACHE_ATTEMPTS} o premazanie cache webu zlyhal: {exc}")
+    else:
+        log("UPOZORNENIE: cache webu sa nepodarilo potvrdit, zmeny sa na webe mozu prejavit neskor.")
         return
+    if result.get("ok") == 0:
+        log(f"UPOZORNENIE pri mazani cache: {result.get('error')}")
+        return
+    # nahladovy web EOS (preview) je nepodstatny, admin ho vsak maze spolu s ostrym webom
     for url in result.get("cleared") or []:
-        log(f"Cache webu premazana: {url}")
+        if ".preview." not in url:
+            log(f"Cache webu premazana: {url}")
     for err in result.get("errors") or []:
-        log(f"CHYBA pri mazani cache {err.get('url')}: {err.get('error')}")
+        if ".preview." not in (err.get("url") or ""):
+            log(f"UPOZORNENIE: cache {err.get('url')} sa nepremazala: {err.get('error')}")
 
 
 # --- Zapasy ------------------------------------------------------------------
@@ -516,9 +548,13 @@ def sync_games(opener, comp, results_page, apply):
             })
             if field(f, "game_status") != STATUS_FORFEIT:
                 wanted["game_status"] = STATUS_PLAYED
-            periods = szfb_periods(opener, src["url"]) if src["url"] else ""
-            if periods:
-                wanted["tretiny"] = periods
+            # detail zapasu stahovat len ked treba: tretiny chybaju alebo sa zmenilo skore
+            score_same = (game_value(f, "score_home") == src["score_home"]
+                          and game_value(f, "score_away") == src["score_away"])
+            if src["url"] and not (score_same and game_value(f, "tretiny")):
+                periods = szfb_periods(opener, src["url"])
+                if periods:
+                    wanted["tretiny"] = periods
         diff = {k: v for k, v in wanted.items() if game_value(f, k) != v}
         if not diff:
             continue
@@ -648,19 +684,31 @@ def main():
 
     try:
         changed = 0
+        failed = []
+        results_pages = {}   # divizie jednej ligy zdielaju tu istu stranku vysledkov
         for comp in COMPETITIONS:
             log(f"=== {comp.name} ===")
-            _, results_page = fetch(opener, comp.results)
-            if comp.games:
-                changed += sync_games(opener, comp, results_page, args.apply)
-            if comp.with_standings:
-                changed += sync_standings(opener, comp, results_page, args.apply)
+            # vypadok jednej sutaze nesmie zastavit ostatne
+            try:
+                if comp.results not in results_pages:
+                    results_pages[comp.results] = fetch(opener, comp.results)[1]
+                results_page = results_pages[comp.results]
+                if comp.games:
+                    changed += sync_games(opener, comp, results_page, args.apply)
+                if comp.with_standings:
+                    changed += sync_standings(opener, comp, results_page, args.apply)
+            except NETWORK_ERRORS as exc:
+                failed.append(comp.name)
+                log(f"CHYBA: {comp.name} sa nespracovala: {exc}")
+        # po zlyhani mohli byt niektore zmeny zapisane, preto cache mazat aj vtedy
+        if args.apply and (changed or failed):
+            clear_web_cache(opener)
+        if not args.apply and changed:
+            log(f"{changed} zmien na zapis. Spusti s --apply pre zapis.")
+        if failed:
+            sys.exit(f"Nespracovane sutaze ({len(failed)}): {', '.join(failed)}")
         if changed == 0:
             log("Vsetko je aktualne.")
-        elif args.apply:
-            clear_web_cache(opener)
-        else:
-            log(f"{changed} zmien na zapis. Spusti s --apply pre zapis.")
     finally:
         jar.save(ignore_discard=True)
         os.chmod(COOKIE_FILE, 0o600)
